@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>speedcurl</title>
+<style>
+  :root { --bg:#0a0e14; --fg:#c8d8e8; --accent:#00ff9f; --dim:#5a6b7a; --bar:#10202a; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; min-height:100%; background:var(--bg); color:var(--fg);
+    font-family:'Courier New',ui-monospace,monospace; }
+  .wrap { max-width:520px; margin:0 auto; padding:34px 20px; }
+  h1 { font-size:22px; color:var(--accent); letter-spacing:3px; margin:0 0 2px; }
+  .sub { color:var(--dim); font-size:13px; margin-bottom:26px; }
+  .host { color:#00d4ff; }
+  .metric { margin:20px 0; }
+  .metric .label { font-size:13px; color:var(--dim); display:flex; justify-content:space-between; }
+  .metric .val { font-size:36px; font-weight:bold; color:var(--accent); line-height:1.1; }
+  .metric .unit { font-size:15px; color:var(--dim); font-weight:normal; }
+  .bar { height:6px; background:var(--bar); border-radius:3px; margin-top:7px; overflow:hidden; }
+  .bar > i { display:block; height:100%; width:0; background:var(--accent); transition:width .15s; }
+  button { width:100%; margin-top:28px; padding:14px; font:inherit; font-size:16px;
+    background:rgba(0,255,159,.08); color:var(--accent); border:1px solid var(--accent);
+    border-radius:6px; cursor:pointer; letter-spacing:1px; transition:.15s; }
+  button:hover:not(:disabled) { background:rgba(0,255,159,.18); box-shadow:0 0 10px rgba(0,255,159,.3); }
+  button:disabled { opacity:.5; cursor:default; }
+  .status { margin-top:14px; min-height:18px; font-size:13px; color:var(--dim); text-align:center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>speedcurl</h1>
+  <div class="sub">in-memory speedtest &middot; <span class="host" id="host"></span></div>
+
+  <div class="metric">
+    <div class="label"><span>PING</span><span id="ping-extra"></span></div>
+    <div class="val"><span id="ping">--</span> <span class="unit">ms</span></div>
+  </div>
+  <div class="metric">
+    <div class="label"><span>DOWNLOAD</span><span id="down-extra"></span></div>
+    <div class="val"><span id="down">--</span> <span class="unit">Mbit/s</span></div>
+    <div class="bar"><i id="down-bar"></i></div>
+  </div>
+  <div class="metric">
+    <div class="label"><span>UPLOAD</span><span id="up-extra"></span></div>
+    <div class="val"><span id="up">--</span> <span class="unit">Mbit/s</span></div>
+    <div class="bar"><i id="up-bar"></i></div>
+  </div>
+
+  <button id="run">&#9654; RUN TEST</button>
+  <div class="status" id="status">ready</div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+$("host").textContent = location.host;
+
+const PING_COUNT = 20;
+const DOWN_SECONDS = 8;               // time-box: slow links don't hang, fast links still saturate
+const DOWN_REQUEST_MB = 4096;         // ask for plenty; the timer governs how much we actually pull
+const UP_BYTES = 16 * 1024 * 1024;    // 16 MiB upload sample
+
+const fmt = n => (n >= 100 ? n.toFixed(0) : n.toFixed(1));
+// sqrt scale so both ~20 Mbit home links and ~1 Gbit links read sensibly (1 Gbit = full bar)
+const barW = m => Math.min(100, Math.sqrt(Math.max(0, m) / 1000) * 100);
+
+async function ping() {
+  // warm-up (DNS/TCP/TLS) is not counted
+  try { await fetch("/ping?_=" + Math.random(), { cache: "no-store" }); } catch (e) {}
+  const s = [];
+  for (let i = 0; i < PING_COUNT; i++) {
+    const t = performance.now();
+    await fetch("/ping?_=" + Math.random(), { cache: "no-store" });
+    s.push(performance.now() - t);
+    $("ping").textContent = fmt(Math.min(...s));
+  }
+  const min = Math.min(...s);
+  const avg = s.reduce((a, b) => a + b, 0) / s.length;
+  let jit = 0;
+  for (let i = 1; i < s.length; i++) jit += Math.abs(s[i] - s[i - 1]);
+  jit /= (s.length - 1);
+  $("ping").textContent = fmt(min);
+  $("ping-extra").textContent = "avg " + fmt(avg) + " / jit " + fmt(jit) + " ms";
+}
+
+async function download() {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), DOWN_SECONDS * 1000);
+  const t0 = performance.now();
+  let bytes = 0;
+  try {
+    const r = await fetch("/download?mb=" + DOWN_REQUEST_MB, { cache: "no-store", signal: ctrl.signal });
+    const reader = r.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.length;
+      const sec = (performance.now() - t0) / 1000;
+      if (sec > 0.2) {
+        const mbps = (bytes * 8) / 1e6 / sec;
+        $("down").textContent = fmt(mbps);
+        $("down-bar").style.width = barW(mbps) + "%";
+      }
+    }
+  } catch (e) { /* AbortError from the time-box is expected */ }
+  clearTimeout(timer);
+  const sec = (performance.now() - t0) / 1000;
+  const mbps = (bytes * 8) / 1e6 / sec;
+  $("down").textContent = fmt(mbps);
+  $("down-bar").style.width = barW(mbps) + "%";
+  $("down-extra").textContent = (bytes / 1048576).toFixed(0) + " MiB / " + sec.toFixed(1) + " s";
+}
+
+function makePayload(n) {
+  // Incompressible-ish data via a fast xorshift fill (crypto.getRandomValues caps at 64 KiB/call).
+  const buf = new Uint8Array(n);
+  let x = 0x9e3779b9 >>> 0;
+  for (let i = 0; i < n; i++) {
+    x ^= x << 13; x ^= x >>> 17; x ^= x << 5; x >>>= 0;
+    buf[i] = x & 0xff;
+  }
+  return buf;
+}
+
+async function upload() {
+  $("up-extra").textContent = "preparing…";
+  const payload = makePayload(UP_BYTES);
+  $("up-extra").textContent = "";
+  const t0 = performance.now();
+  const r = await fetch("/upload", {
+    method: "POST", body: payload, cache: "no-store",
+    headers: { "Content-Type": "application/octet-stream" },
+  });
+  const j = await r.json();
+  const sec = (performance.now() - t0) / 1000;
+  // The server's own mbps is authoritative (it times first→last received chunk).
+  const mbps = j.mbps || ((UP_BYTES * 8) / 1e6 / sec);
+  $("up").textContent = fmt(mbps);
+  $("up-bar").style.width = barW(mbps) + "%";
+  $("up-extra").textContent = (UP_BYTES / 1048576).toFixed(0) + " MiB / " + (j.seconds || sec).toFixed(2) + " s";
+}
+
+$("run").addEventListener("click", async () => {
+  const btn = $("run");
+  btn.disabled = true;
+  ["ping", "down", "up"].forEach(id => { $(id).textContent = "--"; $(id + "-extra").textContent = ""; });
+  $("down-bar").style.width = "0"; $("up-bar").style.width = "0";
+  try {
+    $("status").textContent = "measuring latency…";   await ping();
+    $("status").textContent = "measuring download…";  await download();
+    $("status").textContent = "measuring upload…";    await upload();
+    $("status").textContent = "done";
+  } catch (e) {
+    $("status").textContent = "error: " + (e && e.message ? e.message : e);
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

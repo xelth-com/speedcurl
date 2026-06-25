@@ -139,16 +139,18 @@ async fn limit_concurrency(
     }
 }
 
-/// Human-readable usage banner.
+/// Serve the browser speedtest UI.
+///
+/// A single self-contained page (HTML + CSS + vanilla JS) baked into the binary at
+/// compile time via `include_str!` — keeps speedcurl one dependency-free, zero-disk
+/// binary while letting any device run a test just by opening the URL. The page
+/// drives the same `/ping`, `/download`, `/upload` endpoints over `fetch`.
 async fn index() -> Response {
-    let body = concat!(
-        "speedcurl — in-memory speedtest engine\n\n",
-        "GET  /ping              latency probe, returns \"pong\"\n",
-        "GET  /download?bytes=N  stream N bytes of incompressible data\n",
-        "GET  /download?mb=N     stream N mebibytes (takes precedence over bytes)\n",
-        "POST /upload            consume the request body and report throughput\n",
-    );
-    ([(header::CACHE_CONTROL, "no-store")], body).into_response()
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("index.html"),
+    )
+        .into_response()
 }
 
 /// Tiny, uncached latency probe.
