@@ -1,2 +1,8 @@
 # Added by eck-snapshot to ignore metadata directory
 .eck/
+.mcp.json
+
+
+# Added by cargo
+
+/target
