@@ -7,20 +7,22 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use axum::{
     Router,
     body::Body,
-    extract::{DefaultBodyLimit, RawQuery},
+    extract::{DefaultBodyLimit, RawQuery, Request, State},
     http::{StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 /// Size of each streamed slice. 256 KiB keeps syscall/framing overhead low while
 /// staying friendly to the allocator and the network stack's write buffers.
@@ -34,6 +36,11 @@ const MAX_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 
 /// Default listen port; overridable via the `PORT` environment variable.
 const DEFAULT_PORT: u16 = 3220;
+
+/// Default cap on concurrently in-flight requests; overridable via `MAX_CONCURRENCY`.
+/// Standalone (no proxy) means there is no upstream load shedder, so the engine
+/// caps itself to keep an L7 flood from exhausting the Tokio worker pool / memory.
+const DEFAULT_MAX_CONCURRENCY: usize = 100;
 
 /// The master payload, generated once at first use. Filled with a deterministic
 /// xorshift stream so the data is effectively incompressible — proxies and
@@ -62,17 +69,30 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
 
-    println!("speedcurl listening on http://{addr}");
+    println!(
+        "speedcurl listening on http://{addr} (max {} concurrent requests)",
+        max_concurrency()
+    );
     axum::serve(listener, app())
         .await
         .expect("server terminated unexpectedly");
 }
 
-/// Build the speedcurl `Router`.
+/// Build the speedcurl `Router` with the configured concurrency cap.
 ///
 /// Extracted from `main` so the full routing + middleware stack can be exercised
 /// in-process via `tower::ServiceExt::oneshot` — no sockets, no ports, no I/O.
 fn app() -> Router {
+    app_with_limit(max_concurrency())
+}
+
+/// Build the router with an explicit max in-flight request cap.
+///
+/// Separated out so tests can pin the limit deterministically (e.g. `0` to force
+/// the saturated/shed-load path) without depending on the environment.
+fn app_with_limit(max_concurrent: usize) -> Router {
+    let limiter = Arc::new(Semaphore::new(max_concurrent));
+
     Router::new()
         .route("/", get(index))
         .route("/ping", get(ping))
@@ -80,6 +100,43 @@ fn app() -> Router {
         .route("/upload", post(upload))
         // A speedtest exists to move large bodies; the default 2 MiB cap is fatal here.
         .layer(DefaultBodyLimit::disable())
+        // Outermost layer: shed load before any handler work begins.
+        .layer(middleware::from_fn_with_state(limiter, limit_concurrency))
+}
+
+/// Resolve the concurrency cap from `MAX_CONCURRENCY`, falling back to the default.
+fn max_concurrency() -> usize {
+    std::env::var("MAX_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_CONCURRENCY)
+}
+
+/// L7 DoS guard: bound the number of requests in flight at once.
+///
+/// `try_acquire` is non-blocking, so when the cap is reached we **shed load
+/// instantly** with `503 Service Unavailable` instead of queueing the request.
+/// Queueing under a flood would let connections pile up and exhaust memory and
+/// the worker pool — the very thing this protects against. The permit is held for
+/// the whole request and released automatically when it completes.
+async fn limit_concurrency(
+    State(limiter): State<Arc<Semaphore>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match limiter.try_acquire() {
+        Ok(_permit) => next.run(request).await,
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                (header::RETRY_AFTER, "1"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            "server at capacity\n",
+        )
+            .into_response(),
+    }
 }
 
 /// Human-readable usage banner.
@@ -194,7 +251,7 @@ mod tests {
     //! so the full extractor/handler/middleware stack is exercised without binding a
     //! socket — fast, deterministic, and free of port contention in CI.
 
-    use super::{DEFAULT_DOWNLOAD_BYTES, app};
+    use super::{DEFAULT_DOWNLOAD_BYTES, app, app_with_limit};
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
     use tower::ServiceExt; // brings `.oneshot()` into scope
@@ -326,5 +383,39 @@ mod tests {
         assert_eq!(json["received_bytes"].as_u64().unwrap(), len);
         assert!(json["seconds"].as_f64().is_some(), "missing `seconds` metric");
         assert!(json["mbps"].as_f64().is_some(), "missing `mbps` metric");
+    }
+
+    /// When the concurrency cap is saturated the limiter must shed load *fast*:
+    /// reply `503 Service Unavailable` with a `Retry-After` header rather than
+    /// queueing the request. That fast rejection is what protects the standalone
+    /// edge server from L7 connection-exhaustion floods. A zero-permit limiter is
+    /// permanently saturated, so this exercises the rejection path deterministically.
+    #[tokio::test]
+    async fn concurrency_limit_sheds_load_with_503() {
+        let response = app_with_limit(0)
+            .oneshot(Request::builder().uri("/ping").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response.headers().contains_key(header::RETRY_AFTER),
+            "503 response must carry a Retry-After header"
+        );
+    }
+
+    /// The limiter must be transparent under normal load: a request that fits
+    /// within the cap reaches its handler unchanged (here, `/ping` still returns
+    /// `200 pong`). Guards against the middleware accidentally blocking traffic.
+    #[tokio::test]
+    async fn request_passes_when_under_limit() {
+        let response = app_with_limit(8)
+            .oneshot(Request::builder().uri("/ping").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"pong");
     }
 }
