@@ -10,6 +10,12 @@ tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 bytes = "1"
 
+# Test-only: drive the Router in-process (no sockets) and validate JSON output.
+# Both already resolve to versions in axum's tree, so they add no new downloads.
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+serde_json = "1"
+
 # Speed is the product. Squeeze the release binary for maximum throughput.
 [profile.release]
 opt-level = 3

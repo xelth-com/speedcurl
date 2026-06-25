@@ -482,7 +482,9 @@ dependencies = [
  "axum",
  "bytes",
  "futures-util",
+ "serde_json",
  "tokio",
+ "tower",
 ]
 
 [[package]]

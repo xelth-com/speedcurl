@@ -57,23 +57,29 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    let app = Router::new()
-        .route("/", get(index))
-        .route("/ping", get(ping))
-        .route("/download", get(download))
-        .route("/upload", post(upload))
-        // A speedtest exists to move large bodies; the default 2 MiB cap is fatal here.
-        .layer(DefaultBodyLimit::disable());
-
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
 
     println!("speedcurl listening on http://{addr}");
-    axum::serve(listener, app)
+    axum::serve(listener, app())
         .await
         .expect("server terminated unexpectedly");
+}
+
+/// Build the speedcurl `Router`.
+///
+/// Extracted from `main` so the full routing + middleware stack can be exercised
+/// in-process via `tower::ServiceExt::oneshot` — no sockets, no ports, no I/O.
+fn app() -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/ping", get(ping))
+        .route("/download", get(download))
+        .route("/upload", post(upload))
+        // A speedtest exists to move large bodies; the default 2 MiB cap is fatal here.
+        .layer(DefaultBodyLimit::disable())
 }
 
 /// Human-readable usage banner.
@@ -178,4 +184,147 @@ fn requested_size(query: Option<&str>) -> u64 {
         .or(bytes)
         .unwrap_or(DEFAULT_DOWNLOAD_BYTES)
         .min(MAX_DOWNLOAD_BYTES)
+}
+
+#[cfg(test)]
+mod tests {
+    //! In-process integration tests.
+    //!
+    //! Every case drives the real [`app`] router through `tower::ServiceExt::oneshot`,
+    //! so the full extractor/handler/middleware stack is exercised without binding a
+    //! socket — fast, deterministic, and free of port contention in CI.
+
+    use super::{DEFAULT_DOWNLOAD_BYTES, app};
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode, header};
+    use tower::ServiceExt; // brings `.oneshot()` into scope
+
+    /// `/ping` is the latency probe. Clients derive round-trip latency from it, so
+    /// it must reliably return `200 OK` with the exact, tiny body `pong`.
+    #[tokio::test]
+    async fn ping_returns_pong() {
+        let response = app()
+            .oneshot(Request::builder().uri("/ping").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"pong");
+    }
+
+    /// `/download?bytes=N` must stream *exactly* N bytes and advertise a matching
+    /// `Content-Length`. Clients trust that header to measure throughput precisely
+    /// and to detect a truncated transfer, so both must agree with the body.
+    #[tokio::test]
+    async fn download_honors_bytes_param() {
+        let n = 4096usize;
+
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/download?bytes={n}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_LENGTH).unwrap(),
+            n.to_string().as_str()
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.len(), n);
+    }
+
+    /// `?mb=N` is mebibyte sugar and must take precedence over `bytes`. The 2 MiB
+    /// size also spans multiple internal 256 KiB chunks, exercising the `unfold`
+    /// streaming loop rather than a single slice. We pass a conflicting `bytes=1`
+    /// to prove precedence is honored.
+    #[tokio::test]
+    async fn download_mb_takes_precedence_over_bytes() {
+        let mb = 2u64;
+        let expected = (mb * 1024 * 1024) as usize;
+
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/download?bytes=1&mb={mb}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_LENGTH).unwrap(),
+            expected.to_string().as_str()
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.len(), expected);
+    }
+
+    /// A bare `/download` with no size parameter must fall back to the documented
+    /// default, so the simplest possible request is still a useful test. We assert
+    /// on the header only and never drain the (100 MiB) lazy body, keeping the test
+    /// cheap.
+    #[tokio::test]
+    async fn download_defaults_when_size_unspecified() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/download")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_LENGTH).unwrap(),
+            DEFAULT_DOWNLOAD_BYTES.to_string().as_str()
+        );
+    }
+
+    /// `/upload` must consume a streamed body without buffering it to disk and then
+    /// report accurate metrics. We verify the byte count round-trips exactly and
+    /// that the response is *valid JSON* carrying the documented fields — the whole
+    /// point of the endpoint is a trustworthy machine-readable measurement.
+    #[tokio::test]
+    async fn upload_counts_bytes_and_returns_valid_json() {
+        let payload = vec![0u8; 1024 * 1024]; // 1 MiB
+        let len = payload.len() as u64;
+
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("/upload must return valid JSON");
+
+        assert_eq!(json["received_bytes"].as_u64().unwrap(), len);
+        assert!(json["seconds"].as_f64().is_some(), "missing `seconds` metric");
+        assert!(json["mbps"].as_f64().is_some(), "missing `mbps` metric");
+    }
 }
